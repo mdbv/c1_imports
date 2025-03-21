@@ -1,0 +1,12 @@
+services:
+  c1_imports:
+    image: ghcr.io/mdbv/c1_imports:latest
+    hostname: c1_imports
+    env_file:
+      - .env
+    volumes:
+      - data:/app/files
+    restart: unless-stopped
+
+volumes:
+  data:
