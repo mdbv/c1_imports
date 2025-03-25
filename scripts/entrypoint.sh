@@ -13,7 +13,7 @@ echo "Setting up cron schedule: ${CRON_MINUTE} ${CRON_HOUR} ${CRON_DOM} ${CRON_M
 # Create crontab file dynamically
 cat > /etc/cron.d/app-cron << EOF
 # Cron job with dynamic schedule
-${CRON_MINUTE} ${CRON_HOUR} ${CRON_DOM} ${CRON_MONTH} ${CRON_DOW} /app/c1get.sh >> /var/log/cron.log 2>&1
+${CRON_MINUTE} ${CRON_HOUR} ${CRON_DOM} ${CRON_MONTH} ${CRON_DOW} root /app/c1get.sh >> /var/log/cron.log 2>&1
 
 # Empty line at the end is required
 EOF
