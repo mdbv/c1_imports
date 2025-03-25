@@ -13,7 +13,6 @@ TIMESTAMP=$(date '+%Y%m%d_%H%M%S')
 LOG_FILE="${LOG_DIR}/sftp_sync_${TIMESTAMP}.log"
 LATEST_LOG_LINK="${LOG_DIR}/sftp_sync_latest.log"
 ln -sf ${LOG_FILE} ${LATEST_LOG_LINK}
-ln -sf ${LOG_FILE} ${LOCAL_DIR}/sftp_sync_latest.log
 
 # SFTP connection details
 SFTP_HOST="${SFTP_HOST}"
