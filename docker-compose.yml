@@ -7,6 +7,12 @@ services:
     volumes:
       - data:/app/files
     restart: unless-stopped
-
+  filegator:
+    image: filegator:latest
+    restart: always
+    volumes:
+      - data:/var/www/filegator/repository
+      - private:/var/www/filegator/private
 volumes:
   data:
+  private:
