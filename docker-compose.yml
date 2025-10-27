@@ -8,7 +8,7 @@ services:
       - data:/app/files
     restart: unless-stopped
   filegator:
-    image: filegator:latest
+    image: filegator/filegator:latest
     restart: always
     volumes:
       - data:/var/www/filegator/repository
