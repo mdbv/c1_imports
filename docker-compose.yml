@@ -1,18 +1,17 @@
 services:
   c1_imports:
+    build: .
     image: ghcr.io/mdbv/c1_imports:latest
     hostname: c1_imports
     env_file:
       - .env
+    ports:
+      - "8000:8000"
     volumes:
       - data:/app/files
+      - state:/app/state
     restart: unless-stopped
-  filegator:
-    image: filegator/filegator:latest
-    restart: always
-    volumes:
-      - data:/var/www/filegator/repository
-      - private:/var/www/filegator/private
+
 volumes:
   data:
-  private:
+  state:

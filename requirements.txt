@@ -1,0 +1,7 @@
+python-fasthtml==0.14.13
+monsterui==1.0.47
+authlib==1.9.1
+httpx==0.28.1
+itsdangerous==2.2.0
+uvicorn==0.54.0
+python-multipart==0.0.32

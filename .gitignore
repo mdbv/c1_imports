@@ -2,3 +2,8 @@
 .env
 files/
 *.log
+.venv/
+.local/
+__pycache__/
+*.pyc
+.sesskey
