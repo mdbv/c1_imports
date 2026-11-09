@@ -26,7 +26,7 @@ def connect() -> sqlite3.Connection:
 
 
 def record_download(path: str, downloaded_by: str, oid: str) -> None:
-    downloaded_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    downloaded_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     conn = connect()
     try:
         conn.execute(

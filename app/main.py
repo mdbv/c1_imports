@@ -1,5 +1,6 @@
 import logging
 import re
+from datetime import datetime, timezone
 from urllib.parse import urlencode
 
 from starlette.exceptions import HTTPException
@@ -35,8 +36,25 @@ app, rt = fast_app(
     hdrs=tuple(Theme.blue.headers()) + (
         Style("""
 .file-table a { color: inherit; }
+.file-table th a { font-weight: 600; text-decoration: none; }
 .file-table td, .file-table th { vertical-align: middle; }
 .log-panel { background: hsl(var(--muted) / 0.45); }
+.log-line { white-space: pre-wrap; }
+.date-caution {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  margin-left: 0.5rem;
+  border-radius: 9999px;
+  background: #fef3c7;
+  color: #92400e;
+  font-size: 0.75rem;
+  font-weight: 600;
+  padding: 0.125rem 0.5rem;
+  vertical-align: middle;
+}
+.dark .date-caution { background: #451a03; color: #fcd34d; }
+.date-caution[hidden] { display: none; }
 .theme-icon-sun { display: none; }
 .dark .theme-icon-sun { display: block; }
 .dark .theme-icon-moon { display: none; }
@@ -68,6 +86,54 @@ document.addEventListener("DOMContentLoaded", () => c1ApplyTheme(c1StoredTheme()
 window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => {
   if (!c1StoredTheme().mode) c1ApplyTheme("");
 });
+function c1LocalTime(iso) {
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return null;
+  const text = new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" }).format(date);
+  return { date, text };
+}
+function c1RefreshTimes(root) {
+  const scope = root && root.querySelectorAll ? root : document;
+  scope.querySelectorAll("time[datetime]").forEach((node) => {
+    const formatted = c1LocalTime(node.dateTime);
+    if (formatted) node.textContent = formatted.text;
+  });
+  scope.querySelectorAll("option[data-utc]").forEach((node) => {
+    const formatted = c1LocalTime(node.dataset.utc);
+    if (formatted) node.textContent = formatted.text;
+  });
+  scope.querySelectorAll("tr[data-name-md]").forEach((row) => {
+    const badge = row.querySelector(".date-caution");
+    const stamp = row.querySelector("time[datetime]");
+    if (!badge || !stamp) return;
+    const formatted = c1LocalTime(stamp.dateTime);
+    if (!formatted) return;
+    const md = row.dataset.nameMd;
+    const month = Number(md.slice(0, 2));
+    const day = Number(md.slice(2));
+    const probe = new Date(2024, month - 1, day);
+    const valid = month >= 1 && month <= 12 && probe.getMonth() === month - 1 && probe.getDate() === day;
+    let title = "";
+    if (!valid) {
+      title = "The file name contains " + md + ", which is not a valid month and day.";
+    } else if (formatted.date.getMonth() + 1 !== month || formatted.date.getDate() !== day) {
+      const shown = new Intl.DateTimeFormat(undefined, { month: "long", day: "numeric", year: "numeric" }).format(formatted.date);
+      const named = new Intl.DateTimeFormat(undefined, { month: "long", day: "numeric", timeZone: "UTC" }).format(new Date(Date.UTC(2024, month - 1, day)));
+      title = "This file is dated " + shown + " in your time zone, but the name says " + named + " (" + md + ").";
+    }
+    if (!title) {
+      badge.hidden = true;
+      badge.removeAttribute("title");
+      badge.removeAttribute("aria-label");
+      return;
+    }
+    badge.hidden = false;
+    badge.title = title;
+    badge.setAttribute("aria-label", title);
+  });
+}
+document.addEventListener("DOMContentLoaded", () => c1RefreshTimes(document));
+document.addEventListener("htmx:afterSwap", () => c1RefreshTimes(document));
 """),
     ),
     pico=False,
@@ -157,14 +223,84 @@ def human_size(size: int) -> str:
 
 _LOG_LINE = re.compile(r"^\[(?P<when>[^\]]+)\] \[(?P<level>[A-Z]+)\] (?P<msg>.*)$")
 _LOG_STAMP = re.compile(r"sftp_sync_(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})\.log$")
+_NAME_DATE = re.compile(r"ertv(\d{2})(\d{2})\.(?:dat|rpt)$", re.IGNORECASE)
+_SORTS = ("name", "date", "downloaded")
+
+
+def parse_utc(value: str) -> datetime | None:
+    text = value.strip()
+    if text.endswith(" UTC"):
+        text = text[:-4].strip()
+    text = text.replace(" ", "T")
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    elif "+" not in text[10:]:
+        text += "+00:00"
+    try:
+        return datetime.fromisoformat(text).astimezone(timezone.utc)
+    except ValueError:
+        return None
+
+
+def utc_time(stamp: datetime):
+    iso = stamp.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    fallback = stamp.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    return Time(fallback, datetime=iso, cls="c1-time")
+
+
+def name_month_day(filename: str) -> str | None:
+    match = _NAME_DATE.search(filename)
+    if not match:
+        return None
+    return f"{match.group(1)}{match.group(2)}"
+
+
+def normalize_sort(sort: str, order: str) -> tuple[str, str]:
+    if sort not in _SORTS:
+        sort = "date"
+    if order not in {"asc", "desc"}:
+        order = "desc"
+    return sort, order
+
+
+def order_entries(entries: list[Entry], sort: str, order: str, history: dict, show_path: bool) -> list[Entry]:
+    reverse = order == "desc"
+
+    def name_key(entry: Entry) -> str:
+        return (entry.rel if show_path else entry.name).casefold()
+
+    folders = [entry for entry in entries if entry.is_dir]
+    files = [entry for entry in entries if not entry.is_dir]
+    if sort == "date":
+        folders.sort(key=lambda entry: entry.created, reverse=reverse)
+        files.sort(key=lambda entry: entry.created, reverse=reverse)
+        return folders + files
+    if sort == "downloaded":
+        folders.sort(key=name_key)
+
+        def downloaded_at(entry: Entry) -> datetime | None:
+            info = history.get(entry.rel)
+            return parse_utc(info["downloaded_at"]) if info else None
+
+        known = [entry for entry in files if downloaded_at(entry)]
+        known_ids = {id(entry) for entry in known}
+        unknown = [entry for entry in files if id(entry) not in known_ids]
+        known.sort(key=downloaded_at, reverse=reverse)
+        unknown.sort(key=name_key)
+        return folders + known + unknown
+    folders.sort(key=name_key, reverse=reverse)
+    files.sort(key=name_key, reverse=reverse)
+    return folders + files
 
 
 def download_bits(info):
     if not info:
         return Span("—", cls="text-muted-foreground")
+    stamp = parse_utc(info["downloaded_at"])
+    when = utc_time(stamp) if stamp else Span(info["downloaded_at"])
     return Div(
         Span(info["downloaded_by"], cls="block"),
-        Span(info["downloaded_at"], cls="block text-xs text-muted-foreground"),
+        Span(when, cls="block text-xs text-muted-foreground"),
     )
 
 
@@ -192,7 +328,14 @@ def named_link(icon, label, href):
     )
 
 
-def file_rows(entries: list[Entry], history: dict, show_path: bool = False, empty: str = "No files") -> list:
+def file_rows(
+    entries: list[Entry],
+    history: dict,
+    show_path: bool = False,
+    empty: str = "No files",
+    sort: str = "date",
+    order: str = "desc",
+) -> list:
     if not entries:
         return [Tr(Td(
             P(empty, cls="py-10 text-center text-sm text-muted-foreground"),
@@ -201,38 +344,99 @@ def file_rows(entries: list[Entry], history: dict, show_path: bool = False, empt
     rows = []
     for entry in entries:
         label = entry.rel if show_path else entry.name
+        caution = None
+        row = {}
         if entry.is_dir:
-            name = named_link("folder", label, "/?" + urlencode({"path": entry.rel}))
+            folder_params = {"path": entry.rel}
+            if not (sort == "date" and order == "desc"):
+                folder_params["sort"] = sort
+                folder_params["order"] = order
+            name = named_link("folder", label, "/?" + urlencode(folder_params))
             size = Span("—", cls="text-muted-foreground")
             downloaded = Span("—", cls="text-muted-foreground")
         else:
             name = named_link("file", label, "/download?" + urlencode({"path": entry.rel}))
             size = human_size(entry.size or 0)
             downloaded = download_bits(history.get(entry.rel))
+            month_day = name_month_day(entry.name)
+            if month_day:
+                row["data_name_md"] = month_day
+                caution = Span(
+                    UkIcon("triangle-alert", height=14, width=14),
+                    "Check date",
+                    cls="date-caution",
+                    hidden=True,
+                )
+        name_cell = Td(name, caution) if caution else Td(name)
         rows.append(Tr(
-            Td(name),
+            name_cell,
             Td(size, cls="whitespace-nowrap text-sm text-muted-foreground"),
-            Td(entry.modified, cls="whitespace-nowrap text-sm text-muted-foreground"),
+            Td(utc_time(entry.created), cls="whitespace-nowrap text-sm text-muted-foreground"),
             Td(downloaded),
+            **row,
         ))
     return rows
 
 
-def file_table(entries: list[Entry], caption: str = "", show_path: bool = False, empty: str = "No files"):
+def sort_link(column: str, label: str, sort: str, order: str, path: str, query: str):
+    if sort == column:
+        nxt = "asc" if order == "desc" else "desc"
+        mark = " ↑" if order == "asc" else " ↓"
+        aria = "ascending" if order == "asc" else "descending"
+    else:
+        nxt = "desc" if column in {"date", "downloaded"} else "asc"
+        mark = ""
+        aria = "none"
+    params = {"sort": column, "order": nxt}
+    if path:
+        params["path"] = path
+    if query:
+        params["q"] = query
+    href = "/?" + urlencode(params)
+    return Th(
+        A(
+            label + mark,
+            href=href,
+            hx_get=href,
+            hx_target="#file-list",
+            hx_swap="outerHTML",
+            hx_push_url="true",
+        ),
+        aria_sort=aria,
+    )
+
+
+def file_table(
+    entries: list[Entry],
+    caption: str = "",
+    show_path: bool = False,
+    empty: str = "No files",
+    sort: str = "date",
+    order: str = "desc",
+    path: str = "",
+    query: str = "",
+    sync_sort_fields: bool = False,
+):
     files = [entry.rel for entry in entries if not entry.is_dir]
     history = last_downloads(files)
+    ordered = order_entries(entries, sort, order, history, show_path)
     head = P(caption, cls="border-b px-4 py-3 text-sm text-muted-foreground") if caption else None
+    fields = (
+        Input(type="hidden", name="sort", value=sort, id="sort-field", hx_swap_oob="true"),
+        Input(type="hidden", name="order", value=order, id="order-field", hx_swap_oob="true"),
+    ) if sync_sort_fields else ()
     return Div(
         head,
+        *fields,
         Div(
             Table(
                 Thead(Tr(
-                    Th("Name"),
+                    sort_link("name", "Name", sort, order, path, query),
                     Th("Size"),
-                    Th("Modified"),
-                    Th("Last download"),
+                    sort_link("date", "Date", sort, order, path, query),
+                    sort_link("downloaded", "Last downloaded", sort, order, path, query),
                 )),
-                Tbody(*file_rows(entries, history, show_path=show_path, empty=empty)),
+                Tbody(*file_rows(ordered, history, show_path=show_path, empty=empty, sort=sort, order=order)),
             ),
             cls="file-table overflow-x-auto",
         ),
@@ -241,10 +445,10 @@ def file_table(entries: list[Entry], caption: str = "", show_path: bool = False,
     )
 
 
-def pretty_last_run(summary: str) -> tuple[str, str]:
+def pretty_last_run(summary: str) -> tuple[datetime | None, str]:
     match = _LOG_LINE.match(summary.strip())
     if not match:
-        return "", summary
+        return None, summary
     message = match["msg"]
     if "completed in" in message:
         message = message.replace("SFTP sync process completed in", "Completed in")
@@ -252,12 +456,13 @@ def pretty_last_run(summary: str) -> tuple[str, str]:
         message = "A sync was already running"
     elif message == "SFTP sync completed successfully":
         message = "Sync finished"
-    return match["when"], message
+    return parse_utc(match["when"]), message
 
 
 def sync_panel():
     running, pid = sync_state()
     when, detail = pretty_last_run(last_sync_summary())
+    when_label = utc_time(when) if when else None
     status = f"Running · {pid}" if running and pid else ("Running" if running else "Idle")
     pill = "inline-flex items-center gap-2 rounded-full px-2.5 py-1 text-xs font-medium "
     pill += "bg-primary/10 text-primary" if running else "bg-muted text-muted-foreground"
@@ -274,7 +479,7 @@ def sync_panel():
     return Div(
         Div(
             Span(Span(cls="h-1.5 w-1.5 rounded-full bg-current"), status, cls=pill),
-            P(when, cls="mt-1 text-xs text-muted-foreground") if when else None,
+            P(when_label, cls="mt-1 text-xs text-muted-foreground") if when_label else None,
         ),
         P(detail, cls="min-w-0 flex-1 truncate text-sm text-muted-foreground", title=detail),
         Button(UkIcon("refresh-cw", height=15, width=15), "Run sync", **button),
@@ -286,20 +491,23 @@ def sync_panel():
     )
 
 
-def search_box(path: str, query: str):
+def search_box(path: str, query: str, sort: str, order: str):
     return Form(
         Input(
             type="search",
             name="q",
             value=query,
+            id="q-field",
             placeholder="Search file names",
             hx_get="/",
             hx_trigger="keyup changed delay:300ms, search",
             hx_target="#file-list",
             hx_swap="outerHTML",
-            hx_include="#path-field",
+            hx_include="#path-field,#sort-field,#order-field",
         ),
         Input(type="hidden", name="path", value=path, id="path-field"),
+        Input(type="hidden", name="sort", value=sort, id="sort-field"),
+        Input(type="hidden", name="order", value=order, id="order-field"),
         cls="w-full sm:max-w-sm",
     )
 
@@ -432,9 +640,10 @@ def normalize_dir(rel: str) -> str:
 
 
 @app.get("/")
-def index(req, sess, path: str = "", q: str = ""):
+def index(req, sess, path: str = "", q: str = "", sort: str = "date", order: str = "desc"):
     folder = normalize_dir(path)
     query = q.strip()
+    sort, order = normalize_sort(sort, order)
     caption = ""
     if query:
         entries, truncated = search_files(query)
@@ -443,13 +652,19 @@ def index(req, sess, path: str = "", q: str = ""):
             caption += " (showing the first 500)"
     else:
         _current, entries = list_dir(folder)
+    partial = req.headers.get("hx-target") == "file-list"
     table = file_table(
         entries,
         caption,
         show_path=bool(query),
         empty="No matching files" if query else "No files",
+        sort=sort,
+        order=order,
+        path=folder,
+        query=query,
+        sync_sort_fields=partial,
     )
-    if req.headers.get("hx-target") == "file-list":
+    if partial:
         return table
     location = P("Search results across all folders.", cls="text-sm text-muted-foreground") if query else breadcrumbs(folder)
     return shell(
@@ -462,7 +677,7 @@ def index(req, sess, path: str = "", q: str = ""):
         ),
         Div(
             location,
-            search_box(folder, query),
+            search_box(folder, query, sort, order),
             cls="mb-3 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between",
         ),
         table,
@@ -491,7 +706,7 @@ def logs(req, sess, name: str = ""):
     body = log_body(selected)
     if req.headers.get("hx-target") == "log-body":
         return body
-    options = [Option(log_label(path.name), value=path.name, selected=path.name == selected) for path in files]
+    options = [log_option(path.name, path.name == selected) for path in files]
     picker = (
         fh.Select(
             *options,
@@ -524,21 +739,45 @@ def logs(req, sess, name: str = ""):
     )
 
 
-def log_label(name: str) -> str:
+def log_stamp(name: str) -> datetime | None:
     match = _LOG_STAMP.match(name)
     if not match:
-        return name
-    year, month, day, hour, minute, second = match.groups()
-    return f"{year}-{month}-{day} {hour}:{minute}:{second}"
+        return None
+    year, month, day, hour, minute, second = (int(part) for part in match.groups())
+    return datetime(year, month, day, hour, minute, second, tzinfo=timezone.utc)
+
+
+def log_option(name: str, selected: bool):
+    stamp = log_stamp(name)
+    if not stamp:
+        return Option(name, value=name, selected=selected)
+    fallback = stamp.strftime("%Y-%m-%d %H:%M:%S UTC")
+    iso = stamp.strftime("%Y-%m-%dT%H:%M:%SZ")
+    return Option(fallback, value=name, selected=selected, data_utc=iso)
+
+
+def log_line(line: str):
+    match = _LOG_LINE.match(line)
+    stamp = parse_utc(match["when"]) if match else None
+    if not match or stamp is None:
+        return Div(line, cls="log-line")
+    return Div(
+        "[",
+        utc_time(stamp),
+        f"] [{match['level']}] {match['msg']}",
+        cls="log-line",
+    )
 
 
 def log_body(name: str):
     if not name:
         return Div(P("No sync logs yet.", cls="px-4 py-10 text-center text-sm text-muted-foreground"), id="log-body")
+    text = read_log(name)
+    lines = [log_line(line) for line in text.splitlines()] or [Div("")]
     return Div(
-        Pre(
-            Code(read_log(name)),
-            cls="log-panel m-0 max-h-[70vh] overflow-auto p-4 font-mono text-[13px] leading-6 whitespace-pre-wrap",
+        Div(
+            *lines,
+            cls="log-panel m-0 max-h-[70vh] overflow-auto p-4 font-mono text-[13px] leading-6",
         ),
         id="log-body",
     )

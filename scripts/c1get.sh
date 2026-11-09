@@ -3,15 +3,16 @@
 # Variables from environment variables with defaults
 LOG_DIR="${LOG_DIR:-/var/log}"
 LOCAL_DIR="${LOCAL_DIR:-/app/files}"
+STAGING_DIR="${STAGING_DIR:-/app/state/sftp-staging}"
 LOCK_FILE="${LOCK_FILE:-/var/lock/c1get.lock}"
 LATEST_LOG_LINK="${LOG_DIR}/sftp_sync_latest.log"
 
-mkdir -p "${LOG_DIR}" "${LOCAL_DIR}" "$(dirname "${LOCK_FILE}")"
+mkdir -p "${LOG_DIR}" "${LOCAL_DIR}" "${STAGING_DIR}" "$(dirname "${LOCK_FILE}")"
 
 # One sync at a time. Cron and the web "Run sync" button share this lock.
 exec 9>"${LOCK_FILE}"
 if ! flock -n 9; then
-    timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    timestamp=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
     message="[${timestamp}] [INFO] Sync already in progress, exiting"
     echo "${message}"
     if [ -e "${LATEST_LOG_LINK}" ]; then
@@ -22,7 +23,7 @@ fi
 echo $$ > "${LOCK_FILE}"
 
 # Timestamped log file
-TIMESTAMP=$(date '+%Y%m%d_%H%M%S')
+TIMESTAMP=$(date -u '+%Y%m%d_%H%M%S')
 LOG_FILE="${LOG_DIR}/sftp_sync_${TIMESTAMP}.log"
 ln -sf "${LOG_FILE}" "${LATEST_LOG_LINK}"
 
@@ -40,7 +41,7 @@ start_time=$(date +%s)
 log() {
     local level=$1
     local message=$2
-    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    local timestamp=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
     echo "[${timestamp}] [${level}] ${message}" >> "${LOG_FILE}"
 }
 
@@ -85,6 +86,50 @@ retry_operation() {
     return 1
 }
 
+# Mirror keeps the remote names. Property/ertv1109.dat and Utilities/ertv1109.dat
+# would be indistinguishable once staff download them, so publish a copy whose
+# name starts with the folder it came from. Staging stays a faithful mirror so
+# --delete does not treat those renamed copies as extras.
+publish_files() {
+    local staging="${1%/}"
+    local dest_root="${2%/}"
+    local manifest src rel dir base folder target_rel target existing existing_rel
+
+    manifest=$(mktemp)
+    trap 'rm -f "$manifest"' RETURN
+    mkdir -p "$dest_root"
+
+    while IFS= read -r -d '' src; do
+        rel="${src#"$staging"/}"
+        dir=$(dirname "$rel")
+        base=$(basename "$rel")
+        target_rel="$rel"
+        if [ "$dir" != "." ] && [[ "$base" =~ ^ertv[0-9]{4}\.(dat|rpt)$ ]]; then
+            folder=$(basename "$dir")
+            target_rel="${dir}/${folder}-${base}"
+        fi
+        target="${dest_root}/${target_rel}"
+        mkdir -p "$(dirname "$target")"
+        if [ ! -f "$target" ] || [ "$src" -nt "$target" ] || [ "$(stat -c %s "$src")" != "$(stat -c %s "$target")" ]; then
+            cp -p "$src" "$target"
+            if [ "$target_rel" != "$rel" ]; then
+                log "INFO" "Renamed ${rel} -> ${target_rel}"
+            fi
+        fi
+        printf '%s\0' "$target_rel" >> "$manifest"
+    done < <(find "$staging" -type f -print0)
+
+    while IFS= read -r -d '' existing; do
+        existing_rel="${existing#"$dest_root"/}"
+        if ! grep -F -z -x -q -- "$existing_rel" "$manifest"; then
+            rm -f "$existing"
+            log "INFO" "Removed ${existing_rel}"
+        fi
+    done < <(find "$dest_root" -type f -print0)
+
+    find "$dest_root" -mindepth 1 -type d -empty -delete
+}
+
 # Check required SFTP variables
 check_vars "SFTP_HOST" "SFTP_USER" "SFTP_PASS"
 
@@ -92,14 +137,16 @@ check_vars "SFTP_HOST" "SFTP_USER" "SFTP_PASS"
 log "INFO" "Starting SFTP sync from ${SFTP_HOST}:${SFTP_REMOTE_DIR}"
 
 # Execute the SFTP command with retry
-SFTP_CMD="lftp -u ${SFTP_USER},${SFTP_PASS} sftp://${SFTP_HOST}:${SFTP_PORT} -e \"set sftp:auto-confirm yes; mirror --verbose --only-newer --delete ${SFTP_REMOTE_DIR} ${LOCAL_DIR}; quit\" >> ${LOG_FILE} 2>&1"
-SFTP_LOG_CMD="lftp -u ${SFTP_USER},****** sftp://${SFTP_HOST}:${SFTP_PORT} -e \"set sftp:auto-confirm yes; mirror --verbose --only-newer --delete ${SFTP_REMOTE_DIR} ${LOCAL_DIR}; quit\""
+SFTP_CMD="lftp -u ${SFTP_USER},${SFTP_PASS} sftp://${SFTP_HOST}:${SFTP_PORT} -e \"set sftp:auto-confirm yes; mirror --verbose --only-newer --delete ${SFTP_REMOTE_DIR} ${STAGING_DIR}; quit\" >> ${LOG_FILE} 2>&1"
+SFTP_LOG_CMD="lftp -u ${SFTP_USER},****** sftp://${SFTP_HOST}:${SFTP_PORT} -e \"set sftp:auto-confirm yes; mirror --verbose --only-newer --delete ${SFTP_REMOTE_DIR} ${STAGING_DIR}; quit\""
 
 if ! retry_operation "$SFTP_CMD" "$SFTP_LOG_CMD"; then
     handle_error "SFTP sync failed after multiple attempts"
 fi
 
 log "INFO" "SFTP sync completed successfully"
+publish_files "${STAGING_DIR}" "${LOCAL_DIR}"
+log "INFO" "Published files to ${LOCAL_DIR}"
 
 # Calculate and log runtime
 end_time=$(date +%s)

@@ -1,6 +1,6 @@
 import os
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from starlette.exceptions import HTTPException
@@ -14,7 +14,7 @@ class Entry:
     rel: str
     is_dir: bool
     size: int | None
-    modified: str
+    created: datetime
 
 
 def root() -> Path:
@@ -32,9 +32,10 @@ def resolve_inside(rel: str) -> Path:
     return candidate
 
 
-def _modified(path: Path) -> str:
-    stamp = datetime.fromtimestamp(path.stat().st_mtime)
-    return stamp.strftime("%Y-%m-%d %H:%M")
+def _created(path: Path) -> datetime:
+    # SFTP preserves this timestamp through the mirror. It is the file's own
+    # date, stored as an absolute instant.
+    return datetime.fromtimestamp(path.stat().st_mtime, timezone.utc)
 
 
 def _entry(path: Path, base: Path) -> Entry:
@@ -45,7 +46,7 @@ def _entry(path: Path, base: Path) -> Entry:
         rel=rel,
         is_dir=is_dir,
         size=None if is_dir else path.stat().st_size,
-        modified=_modified(path),
+        created=_created(path),
     )
 
 
