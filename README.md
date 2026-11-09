@@ -35,10 +35,21 @@ Fill in `.env`:
 
 The app listens on port 8000 without TLS. Put it behind the reverse proxy and forward `X-Forwarded-Proto` and `X-Forwarded-For`. `BASE_URL` must be the external origin so the Entra redirect matches.
 
+## Publish
+
+Build the image on this machine and push it to GitHub Container Registry. GitHub Actions does not build it. The version is the UTC date plus a build number for that day, for example `2026.11.9.1`. The script tags the current commit `v2026.11.9.1` and pushes that tag.
+
+```bash
+docker login ghcr.io
+./scripts/publish.sh
+```
+
+The GitHub token needs `write:packages`. Tracked files must already be committed. The registry image is also tagged `latest`.
+
 ## Run
 
 ```bash
-docker compose up -d --build
+docker compose up -d
 ```
 
 Open `BASE_URL`. A session lasts 12 hours.
