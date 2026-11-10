@@ -86,6 +86,22 @@ retry_operation() {
     return 1
 }
 
+# lftp prints the login name while connecting. Keep it out of the sync log.
+redact_log() {
+    local line
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        printf '%s\n' "${line//"$SFTP_USER"/******}"
+    done
+}
+
+run_sftp() {
+    lftp -u "${SFTP_USER},${SFTP_PASS}" \
+        "sftp://${SFTP_HOST}:${SFTP_PORT}" \
+        -e "set sftp:auto-confirm yes; mirror --verbose --only-newer --delete ${SFTP_REMOTE_DIR} ${STAGING_DIR}; quit" \
+        2>&1 | redact_log >> "${LOG_FILE}"
+    return "${PIPESTATUS[0]}"
+}
+
 # Mirror keeps the remote names. Property/ertv1109.dat and Utilities/ertv1109.dat
 # would be indistinguishable once staff download them, so publish a copy whose
 # name starts with the folder it came from. Staging stays a faithful mirror so
@@ -136,11 +152,10 @@ check_vars "SFTP_HOST" "SFTP_USER" "SFTP_PASS"
 # Log start of sync
 log "INFO" "Starting SFTP sync from ${SFTP_HOST}:${SFTP_REMOTE_DIR}"
 
-# Execute the SFTP command with retry
-SFTP_CMD="lftp -u ${SFTP_USER},${SFTP_PASS} sftp://${SFTP_HOST}:${SFTP_PORT} -e \"set sftp:auto-confirm yes; mirror --verbose --only-newer --delete ${SFTP_REMOTE_DIR} ${STAGING_DIR}; quit\" >> ${LOG_FILE} 2>&1"
-SFTP_LOG_CMD="lftp -u ${SFTP_USER},****** sftp://${SFTP_HOST}:${SFTP_PORT} -e \"set sftp:auto-confirm yes; mirror --verbose --only-newer --delete ${SFTP_REMOTE_DIR} ${STAGING_DIR}; quit\""
+# Execute the SFTP command with retry. The logged command omits the login name.
+SFTP_LOG_CMD="lftp sftp://${SFTP_HOST}:${SFTP_PORT} -e \"set sftp:auto-confirm yes; mirror --verbose --only-newer --delete ${SFTP_REMOTE_DIR} ${STAGING_DIR}; quit\""
 
-if ! retry_operation "$SFTP_CMD" "$SFTP_LOG_CMD"; then
+if ! retry_operation "run_sftp" "$SFTP_LOG_CMD"; then
     handle_error "SFTP sync failed after multiple attempts"
 fi
 
