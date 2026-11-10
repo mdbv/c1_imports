@@ -40,6 +40,7 @@ docker push "${image}:${version}"
 docker push "${image}:latest"
 
 git tag -a "$tag" -m "$tag"
-git push origin "$tag"
+# The version tag push must not start another image build.
+C1_PUBLISHING=1 git push origin "$tag"
 
 echo "Published ${image}:${version} (${tag})"

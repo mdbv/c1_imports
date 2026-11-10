@@ -37,14 +37,15 @@ The app listens on port 8000 without TLS. Put it behind the reverse proxy and fo
 
 ## Publish
 
-Build the image on this machine and push it to GitHub Container Registry. GitHub Actions does not build it. The version is the UTC date plus a build number for that day, for example `2026.11.9.1`. The script tags the current commit `v2026.11.9.1` and pushes that tag.
+Pushing a branch builds the image on this machine and uploads it to GitHub Container Registry. GitHub Actions does not build it. The version is the UTC date plus a build number for that day, for example `2026.11.9.1`. That commit is tagged `v2026.11.9.1`.
 
 ```bash
 docker login ghcr.io
-./scripts/publish.sh
+cp scripts/hooks/pre-push .git/hooks/pre-push
+chmod +x .git/hooks/pre-push
 ```
 
-The GitHub token needs `write:packages`. Tracked files must already be committed. The registry image is also tagged `latest`.
+The GitHub token needs `write:packages`. Tracked files must already be committed. The registry image is also tagged `latest`. `./scripts/publish.sh` does the same build without a git push of the branch.
 
 ## Run
 
