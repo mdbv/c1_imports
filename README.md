@@ -31,7 +31,7 @@ Fill in `.env`:
 - `BASE_URL` — the https URL of the site, as users and Entra see it
 - `SESSION_SECRET` — `openssl rand -hex 32`
 - `ENTRA_TENANT_ID`, `ENTRA_CLIENT_ID`, `ENTRA_CLIENT_SECRET`, `ENTRA_GROUP_ID`
-- Cron fields `CRON_MINUTE`, `CRON_HOUR`, `CRON_DOM`, `CRON_MONTH`, `CRON_DOW` (default 06:00 every day)
+- Cron fields `CRON_MINUTE`, `CRON_HOUR`, `CRON_DOM`, `CRON_MONTH`, `CRON_DOW` (default 13:00 UTC every day)
 
 The app listens on port 8000 without TLS. Put it behind the reverse proxy and forward `X-Forwarded-Proto` and `X-Forwarded-For`. `BASE_URL` must be the external origin so the Entra redirect matches.
 

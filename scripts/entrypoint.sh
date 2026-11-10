@@ -3,12 +3,12 @@ set -eu
 
 # Set default cron schedule if not provided
 CRON_MINUTE="${CRON_MINUTE:-0}"
-CRON_HOUR="${CRON_HOUR:-6}"
+CRON_HOUR="${CRON_HOUR:-13}"
 CRON_DOM="${CRON_DOM:-*}"
 CRON_MONTH="${CRON_MONTH:-*}"
 CRON_DOW="${CRON_DOW:-*}"
 
-echo "Setting up cron schedule: ${CRON_MINUTE} ${CRON_HOUR} ${CRON_DOM} ${CRON_MONTH} ${CRON_DOW}"
+echo "Setting up cron schedule: ${CRON_MINUTE} ${CRON_HOUR} ${CRON_DOM} ${CRON_MONTH} ${CRON_DOW} UTC"
 
 mkdir -p /app/files /app/state /app/static /var/log /var/lock
 
@@ -17,7 +17,8 @@ env | grep -v "^_" > /etc/environment
 
 # Create crontab file dynamically with environment variable sourcing
 cat > /etc/cron.d/app-cron << EOF
-# Cron job with dynamic schedule
+# Schedule is interpreted in UTC even if the container TZ is different.
+CRON_TZ=UTC
 ${CRON_MINUTE} ${CRON_HOUR} ${CRON_DOM} ${CRON_MONTH} ${CRON_DOW} root . /etc/environment && /app/c1get.sh >> /var/log/cron.log 2>&1
 
 # Empty line at the end is required
