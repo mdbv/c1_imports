@@ -1,10 +1,13 @@
+import html
 import logging
 import re
-from datetime import datetime, timezone
+import zipfile
+from datetime import date, datetime, timedelta, timezone
+from io import BytesIO
 from urllib.parse import urlencode
 
 from starlette.exceptions import HTTPException
-from starlette.responses import FileResponse, RedirectResponse
+from starlette.responses import FileResponse, HTMLResponse, RedirectResponse, Response
 from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 
 import fasthtml.common as fh
@@ -13,7 +16,7 @@ from fasthtml.svg import Path, Rect
 from monsterui.all import *
 
 from app.auth import groups_omitted, in_group, oauth, user_from_claims
-from app.browser import Entry, list_dir, resolve_inside, root, search_files
+from app.browser import Entry, list_dir, list_files, resolve_inside, root, search_files
 from app.config import DEV_USER, HTTPS_ONLY, LOGOUT_URL, REDIRECT_URI, SESSION_SECRET
 from app.db import last_downloads, record_download
 from app.sync_job import last_sync_summary, list_logs, read_log, start_sync, sync_state
@@ -55,6 +58,39 @@ app, rt = fast_app(
 }
 .dark .date-caution { background: #451a03; color: #fcd34d; }
 .date-caution[hidden] { display: none; }
+.new-files {
+  display: inline-flex;
+  align-items: center;
+  margin-left: 0.5rem;
+  border-radius: 9999px;
+  background: #dbeafe;
+  color: #1e40af;
+  font-size: 0.75rem;
+  font-weight: 600;
+  line-height: 1.25;
+  padding: 0.125rem 0.5rem;
+  vertical-align: middle;
+  white-space: nowrap;
+}
+.dark .new-files { background: #1e3a8a; color: #bfdbfe; }
+.day-picker { display: flex; flex-direction: column; gap: 0.65rem; max-height: 20rem; overflow: auto; }
+.day-picker label { display: flex; align-items: flex-start; gap: 0.6rem; font-size: 0.875rem; cursor: pointer; }
+.day-picker label input.uk-checkbox {
+  width: 1.25rem;
+  height: 1.25rem;
+  min-width: 1.25rem;
+  flex: 0 0 1.25rem;
+  margin: 0.1rem 0 0;
+}
+.day-picker label:has(input:disabled) { opacity: 0.55; cursor: default; }
+#grab-download { position: absolute; width: 0; height: 0; border: 0; }
+#download-modal.uk-open {
+  display: flex !important;
+  align-items: flex-start;
+  justify-content: center;
+  padding: 5rem 1rem 2rem;
+}
+#download-modal .uk-modal-dialog { width: min(32rem, calc(100vw - 2rem)); margin: 0; }
 .theme-icon-sun { display: none; }
 .dark .theme-icon-sun { display: block; }
 .dark .theme-icon-moon { display: none; }
@@ -132,8 +168,27 @@ function c1RefreshTimes(root) {
     badge.setAttribute("aria-label", title);
   });
 }
+function c1ShowDownloadModal() {
+  const modal = document.getElementById("download-modal");
+  if (!modal || modal.dataset.opened) return;
+  if (!window.UIkit || !UIkit.modal) return;
+  modal.dataset.opened = "1";
+  UIkit.modal(modal).show();
+}
+document.addEventListener("click", (event) => {
+  const modal = document.getElementById("download-modal");
+  if (!modal) return;
+  const closer = event.target.closest(".uk-modal-close, [data-uk-close]");
+  const backdrop = event.target === modal;
+  if (!closer && !backdrop) return;
+  if (window.UIkit && UIkit.modal) UIkit.modal(modal).hide();
+  else modal.remove();
+});
 document.addEventListener("DOMContentLoaded", () => c1RefreshTimes(document));
-document.addEventListener("htmx:afterSwap", () => c1RefreshTimes(document));
+document.addEventListener("htmx:afterSwap", () => {
+  c1RefreshTimes(document);
+  c1ShowDownloadModal();
+});
 """),
     ),
     pico=False,
@@ -293,6 +348,20 @@ def order_entries(entries: list[Entry], sort: str, order: str, history: dict, sh
     return folders + files
 
 
+def last_downloaded_file(files: list[Entry]) -> Entry | None:
+    history = last_downloads([entry.rel for entry in files])
+    downloaded = [entry for entry in files if entry.rel in history]
+    if not downloaded:
+        return None
+
+    def rank(entry: Entry):
+        stamp = parse_utc(history[entry.rel]["downloaded_at"])
+        when = stamp or datetime.min.replace(tzinfo=timezone.utc)
+        return (when, entry.created, entry.rel.casefold())
+
+    return max(downloaded, key=rank)
+
+
 def download_bits(info):
     if not info:
         return Span("—", cls="text-muted-foreground")
@@ -319,6 +388,17 @@ def breadcrumbs(rel: str):
     return Nav(*items, cls="flex flex-wrap items-center gap-1.5 text-sm text-muted-foreground", aria_label="Folder")
 
 
+def new_files_badge(files: list[Entry], allowed: set[date], zone: timezone):
+    recent = [entry for entry in files if entry.created.astimezone(zone).date() in allowed]
+    count = len(undownloaded(recent))
+    if not count:
+        return None
+    noun = "file" if count == 1 else "files"
+    verb = "has" if count == 1 else "have"
+    detail = f"{count} {noun} from the last 14 days {verb} not been downloaded"
+    return Span(f"{count} new", cls="new-files", title=detail, aria_label=detail)
+
+
 def named_link(icon, label, href):
     return A(
         UkIcon(icon, height=16, width=16, cls="shrink-0 text-muted-foreground"),
@@ -341,10 +421,14 @@ def file_rows(
             P(empty, cls="py-10 text-center text-sm text-muted-foreground"),
             colspan="4",
         ))]
+    now = datetime.now(timezone.utc)
+    zone = local_zone()
+    allowed = set(recent_dates(now, zone))
     rows = []
     for entry in entries:
         label = entry.rel if show_path else entry.name
         caution = None
+        badge = None
         row = {}
         if entry.is_dir:
             folder_params = {"path": entry.rel}
@@ -352,8 +436,12 @@ def file_rows(
                 folder_params["sort"] = sort
                 folder_params["order"] = order
             name = named_link("folder", label, "/?" + urlencode(folder_params))
-            size = Span("—", cls="text-muted-foreground")
-            downloaded = Span("—", cls="text-muted-foreground")
+            files = list_files(entry.rel)
+            count = len(files)
+            size = f"{count} file" if count == 1 else f"{count} files"
+            latest = last_downloaded_file(files)
+            downloaded = utc_time(latest.created) if latest else Span("—", cls="text-muted-foreground")
+            badge = new_files_badge(files, allowed, zone)
         else:
             name = named_link("file", label, "/download?" + urlencode({"path": entry.rel}))
             size = human_size(entry.size or 0)
@@ -367,7 +455,7 @@ def file_rows(
                     cls="date-caution",
                     hidden=True,
                 )
-        name_cell = Td(name, caution) if caution else Td(name)
+        name_cell = Td(name, *[item for item in (badge, caution) if item is not None])
         rows.append(Tr(
             name_cell,
             Td(size, cls="whitespace-nowrap text-sm text-muted-foreground"),
@@ -508,7 +596,7 @@ def search_box(path: str, query: str, sort: str, order: str):
         Input(type="hidden", name="path", value=path, id="path-field"),
         Input(type="hidden", name="sort", value=sort, id="sort-field"),
         Input(type="hidden", name="order", value=order, id="order-field"),
-        cls="w-full sm:max-w-sm",
+        cls="w-full sm:w-72",
     )
 
 
@@ -517,6 +605,219 @@ def page_heading(title, subtitle):
         H1(title, cls="text-2xl font-semibold tracking-tight"),
         P(subtitle, cls="text-sm text-muted-foreground"),
         cls="space-y-1",
+    )
+
+
+_GRAB_DAYS = 14
+_GRAB_TZ = "js:{tz: String(new Date().getTimezoneOffset())}"
+
+
+def local_zone() -> timezone:
+    offset = datetime.now().astimezone().utcoffset() or timedelta(0)
+    return timezone(offset)
+
+
+def client_zone(tz: str) -> timezone:
+    try:
+        minutes = int(str(tz).strip() or "0")
+    except ValueError:
+        minutes = 0
+    minutes = max(-16 * 60, min(16 * 60, minutes))
+    return timezone(timedelta(minutes=-minutes))
+
+
+def recent_dates(now: datetime, zone: timezone) -> list[date]:
+    today = now.astimezone(zone).date()
+    return [today - timedelta(days=offset) for offset in range(_GRAB_DAYS)]
+
+
+def files_in_window(folder: str, now: datetime, zone: timezone) -> list[Entry]:
+    allowed = set(recent_dates(now, zone))
+    return [
+        entry
+        for entry in list_files(folder)
+        if entry.created.astimezone(zone).date() in allowed
+    ]
+
+
+def undownloaded(entries: list[Entry]) -> list[Entry]:
+    history = last_downloads([entry.rel for entry in entries])
+    pending = [entry for entry in entries if entry.rel not in history]
+    pending.sort(key=lambda entry: (entry.created, entry.rel.casefold()), reverse=True)
+    return pending
+
+
+def parse_days(values: list[str] | None, allowed: set[date]) -> set[date]:
+    chosen: set[date] = set()
+    for value in values or []:
+        try:
+            day = date.fromisoformat(value)
+        except ValueError:
+            continue
+        if day in allowed:
+            chosen.add(day)
+    return chosen
+
+
+def actor(sess) -> tuple[str, str]:
+    user = sess.get("user") or {}
+    name = user.get("name") or user.get("email") or "Unknown"
+    return name, user.get("oid") or ""
+
+
+def mark_downloaded(sess, rels: list[str]) -> None:
+    name, oid = actor(sess)
+    for rel in rels:
+        record_download(rel, name, oid)
+    sess["grab"] = list(rels)
+
+
+def grabbed(sess) -> list[str]:
+    value = sess.get("grab") or []
+    if isinstance(value, str):
+        value = [value]
+    return [item for item in value if isinstance(item, str) and item]
+
+
+def refresh_files():
+    return Div(
+        hx_get="/",
+        hx_trigger="load",
+        hx_target="#file-list",
+        hx_swap="outerHTML",
+        hx_include="#path-field,#sort-field,#order-field,#q-field",
+    )
+
+
+def grab_frame():
+    token = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S%f")
+    return Iframe(
+        src=f"/download/grab?t={token}",
+        id="grab-download",
+        tabindex="-1",
+        aria_hidden="true",
+        title="File download",
+    )
+
+
+def open_modal(*parts, header, footer=None, body_cls="space-y-6"):
+    modal = Modal(
+        *parts,
+        header=header,
+        footer=footer,
+        id="download-modal",
+        body_cls=body_cls,
+        cls="uk-open",
+    )
+    modal.attrs["class"] = modal.attrs.get("class", "").replace("uk-modal-container", "").strip()
+    modal.attrs["hx-on:hidden"] = "this.remove()"
+    return modal
+
+
+def result_modal(rels: list[str]):
+    note = (
+        f"Downloading {len(rels)} files in one zip."
+        if len(rels) != 1
+        else "The file is downloading."
+    )
+    return Div(
+        refresh_files(),
+        grab_frame(),
+        open_modal(
+            P(note, cls="text-sm text-muted-foreground"),
+            Ul(*[Li(rel) for rel in rels], cls="max-h-64 space-y-1 overflow-auto text-sm"),
+            header=ModalTitle("Downloaded"),
+            footer=Div(
+                A(
+                    UkIcon("printer", height=15, width=15),
+                    "Print",
+                    href="/download/print",
+                    target="_blank",
+                    cls="uk-btn uk-btn-primary uk-btn-sm inline-flex items-center gap-2",
+                ),
+                Button("Close", cls=(ButtonT.default, ButtonT.sm, "uk-modal-close"), submit=False),
+                cls="flex items-center justify-end gap-2",
+            ),
+        ),
+    )
+
+
+def day_folder_lines(files: list[Entry]):
+    if not files:
+        return (Span("No files", cls="block text-xs text-muted-foreground"),)
+    counts: dict[str, int] = {}
+    for entry in files:
+        folder = entry.rel.split("/", 1)[0] if "/" in entry.rel else "Files"
+        counts[folder] = counts.get(folder, 0) + 1
+    lines = []
+    for folder, count in sorted(counts.items(), key=lambda item: item[0].casefold()):
+        noun = "file" if count == 1 else "files"
+        lines.append(Span(f"{folder}: {count} {noun}", cls="block text-xs text-muted-foreground"))
+    return tuple(lines)
+
+
+def day_picker(entries: list[Entry], now: datetime, zone: timezone, message: str | None = None):
+    by_day: dict[date, list[Entry]] = {}
+    for entry in entries:
+        by_day.setdefault(entry.created.astimezone(zone).date(), []).append(entry)
+    rows = []
+    any_files = False
+    for day in recent_dates(now, zone):
+        files = sorted(by_day.get(day, []), key=lambda entry: entry.rel.casefold())
+        any_files = any_files or bool(files)
+        attrs = {"name": "day", "value": day.isoformat()}
+        if not files:
+            attrs["disabled"] = "disabled"
+        rows.append(fh.Label(
+            CheckboxX(**attrs),
+            Span(
+                Span(day.strftime("%a, %b ") + str(day.day), cls="font-medium"),
+                *day_folder_lines(files),
+            ),
+        ))
+    intro = (
+        "No new files to download. Would you like to download files from the last two weeks? Select each day to include."
+        if any_files
+        else "No files from the last 14 days."
+    )
+    button_attrs = {} if any_files else {"disabled": "disabled"}
+    return open_modal(
+        P(intro, cls="text-sm"),
+        P(message, cls="text-sm text-amber-700 dark:text-amber-300") if message else None,
+        Form(
+            Div(*rows, cls="day-picker"),
+            Div(
+                Button("Download selected", cls=(ButtonT.primary, ButtonT.sm), **button_attrs),
+                Button("Cancel", cls=(ButtonT.default, ButtonT.sm, "uk-modal-close"), submit=False),
+                cls="flex items-center gap-2",
+            ),
+            id="day-form",
+            cls="space-y-4",
+            hx_post="/download/days",
+            hx_target="#grab-result",
+            hx_swap="innerHTML",
+            hx_include="#path-field",
+            hx_vals=_GRAB_TZ,
+        ),
+        header=ModalTitle("Download files"),
+        body_cls="space-y-4",
+    )
+
+
+def download_button():
+    return Button(
+        UkIcon("download", height=15, width=15),
+        "Download",
+        submit=False,
+        id="download-newest",
+        cls=(ButtonT.primary, ButtonT.sm),
+        hx_post="/download/next",
+        hx_target="#grab-result",
+        hx_swap="innerHTML",
+        hx_include="#path-field",
+        hx_vals=_GRAB_TZ,
+        hx_disabled_elt="this",
+        title="Download every file from the last 14 days that has not been downloaded",
     )
 
 
@@ -677,10 +978,15 @@ def index(req, sess, path: str = "", q: str = "", sort: str = "date", order: str
         ),
         Div(
             location,
-            search_box(folder, query, sort, order),
+            Div(
+                search_box(folder, query, sort, order),
+                download_button(),
+                cls="flex w-full flex-col gap-3 sm:w-auto sm:flex-row sm:items-center",
+            ),
             cls="mb-3 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between",
         ),
         table,
+        Div(id="grab-result"),
     )
 
 
@@ -695,6 +1001,131 @@ def download(sess, path: str = ""):
     user = sess["user"]
     record_download(rel, user.get("name") or user.get("email") or "Unknown", user.get("oid") or "")
     return FileResponse(target, filename=target.name, content_disposition_type="attachment")
+
+
+def grab_targets(sess) -> list[tuple[str, object]]:
+    found = []
+    for rel in grabbed(sess):
+        target = resolve_inside(rel)
+        if not target.is_file():
+            raise HTTPException(404)
+        found.append((rel, target))
+    if not found:
+        raise HTTPException(404)
+    return found
+
+
+@app.post("/download/next")
+def download_next(sess, path: str = "", tz: str = "0"):
+    folder = normalize_dir(path)
+    now = datetime.now(timezone.utc)
+    zone = client_zone(tz)
+    entries = files_in_window(folder, now, zone)
+    pending = undownloaded(entries)
+    if not pending:
+        return day_picker(entries, now, zone)
+    rels = [entry.rel for entry in pending]
+    mark_downloaded(sess, rels)
+    return result_modal(rels)
+
+
+@app.post("/download/days")
+def download_days(sess, path: str = "", tz: str = "0", day: list[str] = None):
+    folder = normalize_dir(path)
+    now = datetime.now(timezone.utc)
+    zone = client_zone(tz)
+    allowed = set(recent_dates(now, zone))
+    entries = files_in_window(folder, now, zone)
+    chosen_days = parse_days(day, allowed)
+    if not chosen_days:
+        return day_picker(entries, now, zone, "Select at least one day.")
+    picked = [
+        entry
+        for entry in entries
+        if entry.created.astimezone(zone).date() in chosen_days
+    ]
+    picked.sort(key=lambda entry: (entry.created, entry.rel.casefold()), reverse=True)
+    if not picked:
+        return day_picker(entries, now, zone, "No files on the selected days.")
+    rels = [entry.rel for entry in picked]
+    mark_downloaded(sess, rels)
+    return result_modal(rels)
+
+
+def zip_name(file_days: list[date]) -> str:
+    unique = sorted(set(file_days), reverse=True)
+    if not unique:
+        return "c1-import.zip"
+    parts = [unique[0].strftime("%m-%d")]
+    previous = unique[0]
+    for day in unique[1:]:
+        if day.month == previous.month and day.year == previous.year:
+            parts.append(f".{day.day:02d}")
+        else:
+            parts.append("." + day.strftime("%m-%d"))
+        previous = day
+    return "c1-import-" + "".join(parts) + ".zip"
+
+
+@app.get("/download/grab")
+def download_grab(sess):
+    paths = grab_targets(sess)
+    headers = {"Cache-Control": "no-store"}
+    if len(paths) == 1:
+        rel, target = paths[0]
+        return FileResponse(
+            target,
+            filename=target.name,
+            content_disposition_type="attachment",
+            headers=headers,
+        )
+    buf = BytesIO()
+    file_days = []
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for rel, target in paths:
+            archive.write(target, arcname=rel)
+            file_days.append(datetime.fromtimestamp(target.stat().st_mtime).date())
+    headers["Content-Disposition"] = f'attachment; filename="{zip_name(file_days)}"'
+    return Response(buf.getvalue(), media_type="application/zip", headers=headers)
+
+
+def print_document(parts: list[tuple[str, str]]) -> str:
+    articles = []
+    for name, text in parts:
+        articles.append(
+            f"<article><h1>{html.escape(name)}</h1><pre>{html.escape(text)}</pre></article>"
+        )
+    body = "\n".join(articles)
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Print · C1 Imports</title>
+<style>
+  html, body {{ background: #fff; color: #111; }}
+  body {{ margin: 24px auto; max-width: 800px; font-family: ui-sans-serif, system-ui, sans-serif; }}
+  h1 {{ margin: 0 0 12px; font-size: 16px; }}
+  pre {{ margin: 0; white-space: pre-wrap; word-break: break-word; font-family: ui-monospace, monospace; font-size: 12px; }}
+  article {{ break-after: page; page-break-after: always; }}
+  article:last-child {{ break-after: auto; page-break-after: auto; }}
+  @media screen {{
+    article + article {{ margin-top: 24px; padding-top: 24px; border-top: 1px solid #ddd; }}
+  }}
+</style>
+</head>
+<body>
+{body}
+<script>window.addEventListener("load", () => window.print());</script>
+</body>
+</html>"""
+
+
+@app.get("/download/print")
+def download_print(sess):
+    parts = []
+    for rel, target in grab_targets(sess):
+        parts.append((rel, target.read_text(encoding="utf-8", errors="replace")))
+    return HTMLResponse(print_document(parts))
 
 
 @app.get("/logs")

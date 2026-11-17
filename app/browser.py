@@ -60,6 +60,33 @@ def list_dir(rel: str) -> tuple[Path, list[Entry]]:
     return current, entries
 
 
+def list_files(rel: str) -> list[Entry]:
+    base = root()
+    current = resolve_inside(rel) if rel else base
+    if not current.exists() or not current.is_dir():
+        raise HTTPException(404)
+    found: list[Entry] = []
+    for dirpath, dirnames, filenames in os.walk(current, followlinks=False):
+        folder = Path(dirpath).resolve()
+        if not folder.is_relative_to(base):
+            dirnames.clear()
+            continue
+        dirnames[:] = sorted(
+            (name for name in dirnames if not (folder / name).is_symlink()),
+            key=str.casefold,
+        )
+        for name in filenames:
+            path = folder / name
+            if path.is_symlink():
+                resolved = path.resolve()
+                if not resolved.is_relative_to(base) or not resolved.is_file():
+                    continue
+            elif not path.is_file():
+                continue
+            found.append(_entry(path, base))
+    return found
+
+
 def search_files(query: str, limit: int = 500) -> tuple[list[Entry], bool]:
     base = root()
     needle = query.casefold()
