@@ -1,10 +1,12 @@
+import hashlib
 import html
+import json
 import logging
 import re
 import zipfile
 from datetime import date, datetime, timedelta, timezone
 from io import BytesIO
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 
 from starlette.exceptions import HTTPException
 from starlette.responses import FileResponse, HTMLResponse, RedirectResponse, Response
@@ -16,9 +18,9 @@ from fasthtml.svg import Path, Rect
 from monsterui.all import *
 
 from app.auth import groups_omitted, in_group, oauth, user_from_claims
-from app.browser import Entry, list_dir, list_files, resolve_inside, root, search_files
+from app.browser import Entry, list_dir, list_files, listing_stamp, resolve_inside, root, search_files
 from app.config import DEV_USER, HTTPS_ONLY, LOGOUT_URL, REDIRECT_URI, SESSION_SECRET
-from app.db import last_downloads, record_download
+from app.db import downloads_revision, last_downloads, record_download
 from app.sync_job import last_sync_summary, list_logs, read_log, start_sync, sync_state
 
 logging.basicConfig(level=logging.INFO)
@@ -184,10 +186,24 @@ document.addEventListener("click", (event) => {
   if (window.UIkit && UIkit.modal) UIkit.modal(modal).hide();
   else modal.remove();
 });
+function c1RefreshFiles() {
+  const node = document.getElementById("file-refresh");
+  if (node && window.htmx) htmx.trigger(node, "refresh");
+}
+document.addEventListener("click", (event) => {
+  const link = event.target.closest("#file-list a[href^='/download?']");
+  if (!link || event.defaultPrevented || event.button !== 0) return;
+  if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey || link.target === "_blank") return;
+  window.setTimeout(c1RefreshFiles, 600);
+});
 document.addEventListener("DOMContentLoaded", () => c1RefreshTimes(document));
-document.addEventListener("htmx:afterSwap", () => {
+document.addEventListener("htmx:afterSwap", (event) => {
   c1RefreshTimes(document);
   c1ShowDownloadModal();
+  const target = event.detail && event.detail.target;
+  if (!target) return;
+  if (target.id === "file-rev" && target.dataset.changed === "1") c1RefreshFiles();
+  if (target.id === "grab-result" && target.querySelector("#refresh-files")) c1RefreshFiles();
 });
 """),
     ),
@@ -276,6 +292,7 @@ def human_size(size: int) -> str:
     return f"{size} B"
 
 
+_FILENAME_BAD = re.compile(r'[\x00-\x1f<>:"/\\|?*]+')
 _LOG_LINE = re.compile(r"^\[(?P<when>[^\]]+)\] \[(?P<level>[A-Z]+)\] (?P<msg>.*)$")
 _LOG_STAMP = re.compile(r"sftp_sync_(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})\.log$")
 _NAME_DATE = re.compile(r"ertv(\d{2})(\d{2})\.(?:dat|rpt)$", re.IGNORECASE)
@@ -494,6 +511,41 @@ def sort_link(column: str, label: str, sort: str, order: str, path: str, query: 
     )
 
 
+def listing_token(folder: str, query: str) -> str:
+    scope = "" if query else folder
+    raw = f"{scope}\0{query}\0{listing_stamp(scope)}\0{downloads_revision()}"
+    return hashlib.sha256(raw.encode()).hexdigest()[:20]
+
+
+def file_refresh():
+    return Div(
+        id="file-refresh",
+        hidden=True,
+        hx_get="/",
+        hx_trigger="refresh",
+        hx_target="#file-list",
+        hx_swap="outerHTML",
+        hx_sync="this:replace",
+        hx_include="#path-field,#sort-field,#order-field,#q-field",
+    )
+
+
+def file_rev(token: str, changed: str = "0", oob: bool = False):
+    attrs = {"hx_swap_oob": "outerHTML"} if oob else {}
+    return Div(
+        id="file-rev",
+        hidden=True,
+        data_changed=changed,
+        hx_get="/files/rev",
+        hx_trigger="every 2s [document.visibilityState=='visible'], refresh",
+        hx_swap="outerHTML",
+        hx_sync="this:drop",
+        hx_include="#path-field,#sort-field,#order-field,#q-field",
+        hx_vals=json.dumps({"rev": token}),
+        **attrs,
+    )
+
+
 def file_table(
     entries: list[Entry],
     caption: str = "",
@@ -512,6 +564,7 @@ def file_table(
     fields = (
         Input(type="hidden", name="sort", value=sort, id="sort-field", hx_swap_oob="true"),
         Input(type="hidden", name="order", value=order, id="order-field", hx_swap_oob="true"),
+        file_rev(listing_token(path, query), oob=True),
     ) if sync_sort_fields else ()
     return Div(
         head,
@@ -665,11 +718,17 @@ def actor(sess) -> tuple[str, str]:
     return name, user.get("oid") or ""
 
 
-def mark_downloaded(sess, rels: list[str]) -> None:
+def mark_downloaded(sess, rels: list[str], folder: str = "") -> None:
     name, oid = actor(sess)
     for rel in rels:
         record_download(rel, name, oid)
     sess["grab"] = list(rels)
+    sess["grab_dir"] = folder
+
+
+def grabbed_dir(sess) -> str:
+    value = sess.get("grab_dir") or ""
+    return value if isinstance(value, str) else ""
 
 
 def grabbed(sess) -> list[str]:
@@ -680,13 +739,7 @@ def grabbed(sess) -> list[str]:
 
 
 def refresh_files():
-    return Div(
-        hx_get="/",
-        hx_trigger="load",
-        hx_target="#file-list",
-        hx_swap="outerHTML",
-        hx_include="#path-field,#sort-field,#order-field,#q-field",
-    )
+    return Div(id="refresh-files", hidden=True)
 
 
 def grab_frame():
@@ -714,12 +767,14 @@ def open_modal(*parts, header, footer=None, body_cls="space-y-6"):
     return modal
 
 
-def result_modal(rels: list[str]):
-    note = (
-        f"Downloading {len(rels)} files in one zip."
-        if len(rels) != 1
-        else "The file is downloading."
-    )
+def result_modal(rels: list[str], folder: str = ""):
+    place = folder.strip("/")
+    if len(rels) == 1:
+        note = "The file is downloading."
+    elif place:
+        note = f"Downloading {len(rels)} files from {place} in one zip."
+    else:
+        note = f"Downloading {len(rels)} files in one zip."
     return Div(
         refresh_files(),
         grab_frame(),
@@ -986,6 +1041,8 @@ def index(req, sess, path: str = "", q: str = "", sort: str = "date", order: str
             cls="mb-3 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between",
         ),
         table,
+        file_refresh(),
+        file_rev(listing_token(folder, query)),
         Div(id="grab-result"),
     )
 
@@ -1025,8 +1082,8 @@ def download_next(sess, path: str = "", tz: str = "0"):
     if not pending:
         return day_picker(entries, now, zone)
     rels = [entry.rel for entry in pending]
-    mark_downloaded(sess, rels)
-    return result_modal(rels)
+    mark_downloaded(sess, rels, folder)
+    return result_modal(rels, folder)
 
 
 @app.post("/download/days")
@@ -1048,14 +1105,22 @@ def download_days(sess, path: str = "", tz: str = "0", day: list[str] = None):
     if not picked:
         return day_picker(entries, now, zone, "No files on the selected days.")
     rels = [entry.rel for entry in picked]
-    mark_downloaded(sess, rels)
-    return result_modal(rels)
+    mark_downloaded(sess, rels, folder)
+    return result_modal(rels, folder)
 
 
-def zip_name(file_days: list[date]) -> str:
+def folder_label(folder: str) -> str:
+    label = _FILENAME_BAD.sub("-", folder.strip())
+    label = re.sub(r"-{2,}", "-", label).strip(" .-")
+    return label[:80]
+
+
+def zip_name(file_days: list[date], folder: str = "") -> str:
+    label = folder_label(folder)
+    prefix = f"c1-import-{label}-" if label else "c1-import-"
     unique = sorted(set(file_days), reverse=True)
     if not unique:
-        return "c1-import.zip"
+        return f"c1-import-{label}.zip" if label else "c1-import.zip"
     parts = [unique[0].strftime("%m-%d")]
     previous = unique[0]
     for day in unique[1:]:
@@ -1064,7 +1129,12 @@ def zip_name(file_days: list[date]) -> str:
         else:
             parts.append("." + day.strftime("%m-%d"))
         previous = day
-    return "c1-import-" + "".join(parts) + ".zip"
+    return prefix + "".join(parts) + ".zip"
+
+
+def attachment_header(filename: str) -> str:
+    quoted = filename.replace("\\", "").replace('"', "")
+    return f"attachment; filename=\"{quoted}\"; filename*=UTF-8''{quote(filename)}"
 
 
 @app.get("/download/grab")
@@ -1085,7 +1155,7 @@ def download_grab(sess):
         for rel, target in paths:
             archive.write(target, arcname=rel)
             file_days.append(datetime.fromtimestamp(target.stat().st_mtime).date())
-    headers["Content-Disposition"] = f'attachment; filename="{zip_name(file_days)}"'
+    headers["Content-Disposition"] = attachment_header(zip_name(file_days, grabbed_dir(sess)))
     return Response(buf.getvalue(), media_type="application/zip", headers=headers)
 
 
@@ -1212,6 +1282,14 @@ def log_body(name: str):
         ),
         id="log-body",
     )
+
+
+@app.get("/files/rev")
+def files_rev(path: str = "", q: str = "", rev: str = ""):
+    folder = normalize_dir(path)
+    query = q.strip()
+    token = listing_token(folder, query)
+    return file_rev(token, changed="1" if token != rev else "0")
 
 
 @app.get("/sync/status")

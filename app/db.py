@@ -45,6 +45,15 @@ def record_download(path: str, downloaded_by: str, oid: str) -> None:
         conn.close()
 
 
+def downloads_revision() -> str:
+    conn = connect()
+    try:
+        count, latest = conn.execute("SELECT COUNT(*), MAX(downloaded_at) FROM downloads").fetchone()
+    finally:
+        conn.close()
+    return f"{count}:{latest or ''}"
+
+
 def last_downloads(paths: list[str]) -> dict[str, sqlite3.Row]:
     if not paths:
         return {}

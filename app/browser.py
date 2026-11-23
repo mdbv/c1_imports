@@ -1,3 +1,4 @@
+import hashlib
 import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -85,6 +86,41 @@ def list_files(rel: str) -> list[Entry]:
                 continue
             found.append(_entry(path, base))
     return found
+
+
+def listing_stamp(rel: str) -> str:
+    base = root()
+    current = resolve_inside(rel) if rel else base
+    if not current.exists() or not current.is_dir():
+        return ""
+    digest = hashlib.sha256()
+    for dirpath, dirnames, filenames in os.walk(current, followlinks=False):
+        folder = Path(dirpath).resolve()
+        if not folder.is_relative_to(base):
+            dirnames.clear()
+            continue
+        dirnames[:] = sorted(
+            (name for name in dirnames if not (folder / name).is_symlink()),
+            key=str.casefold,
+        )
+        for name in sorted(filenames, key=str.casefold):
+            path = folder / name
+            if path.is_symlink():
+                resolved = path.resolve()
+                if not resolved.is_relative_to(base) or not resolved.is_file():
+                    continue
+                stamped = resolved
+            elif path.is_file():
+                stamped = path
+            else:
+                continue
+            try:
+                stat = stamped.stat()
+            except OSError:
+                continue
+            rel_path = path.relative_to(base).as_posix()
+            digest.update(f"{rel_path}\0{stat.st_size}\0{stat.st_mtime_ns}\n".encode())
+    return digest.hexdigest()
 
 
 def search_files(query: str, limit: int = 500) -> tuple[list[Entry], bool]:
