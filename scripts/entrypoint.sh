@@ -2,8 +2,8 @@
 set -eu
 
 # Set default cron schedule if not provided
-CRON_MINUTE="${CRON_MINUTE:-0}"
-CRON_HOUR="${CRON_HOUR:-14}"
+CRON_MINUTE="${CRON_MINUTE:-30}"
+CRON_HOUR="${CRON_HOUR:-15}"
 CRON_DOM="${CRON_DOM:-*}"
 CRON_MONTH="${CRON_MONTH:-*}"
 CRON_DOW="${CRON_DOW:-*}"

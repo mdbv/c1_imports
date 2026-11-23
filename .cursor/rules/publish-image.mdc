@@ -1,0 +1,13 @@
+---
+description: Build and push the container image whenever changes are committed and pushed
+alwaysApply: true
+---
+
+# Publish the image with every push
+
+When you commit and push this repository, that push must also build and publish the container image.
+
+- Push with `git push` and leave git hooks enabled. Do not pass `--no-verify`.
+- `.git/hooks/pre-push` runs `scripts/publish.sh`. That script builds `ghcr.io/mdbv/c1_imports`, pushes the date-versioned tag and `latest`, and pushes the matching git tag.
+- If `.git/hooks/pre-push` is missing, install it from `scripts/hooks/pre-push` (executable) before pushing.
+- The push is complete only after the script prints `Published ghcr.io/mdbv/c1_imports:...`.
