@@ -37,7 +37,7 @@ The app listens on port 8000 without TLS. Put it behind the reverse proxy and fo
 
 ## Publish
 
-Pushing a branch builds the image on this machine and uploads it to GitHub Container Registry. GitHub Actions does not build it. The version is the UTC date plus a build number for that day, for example `2026.11.9.1`. That commit is tagged `v2026.11.9.1`.
+Pushing a branch builds the image on this machine and uploads it to GitHub Container Registry. GitHub Actions does not build it. The version is the UTC year and month plus a build number for that month, for example `2026.11.1`. That commit is tagged `v2026.11.1`.
 
 ```bash
 docker login ghcr.io

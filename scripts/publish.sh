@@ -19,11 +19,12 @@ image="ghcr.io/${remote,,}"
 
 git fetch --tags origin
 
-# YYYY.M.D.N — calendar date in UTC, then the build number for that day.
-# 2026.11.9.1 is the first publish on 9 November 2026.
-day=$(date -u +%Y.%-m.%-d)
-count=$(git tag -l "v${day}" "v${day}.*" | wc -l)
-version="${day}.$((count + 1))"
+# YYYY.M.N — calendar month in UTC, then the build number for that month.
+# 2026.11.1 is the first publish in November 2026.
+# Older tags include the day (v2026.11.23.1) and are not part of this count.
+month=$(date -u +%Y.%-m)
+count=$(git tag -l "v${month}.*" | awk -F. 'NF==3' | wc -l)
+version="${month}.$((count + 1))"
 tag="v${version}"
 
 echo "Building ${image}:${version}"
